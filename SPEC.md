@@ -1,5 +1,17 @@
 # SPEC: syslog-zabbix
 
+## Status
+
+**Deployed — produktiv auf VM 103 (10.1.1.103) seit 2026-04-03**
+
+| Komponente | Status |
+|---|---|
+| Vector 0.54.0 | aktiv, Port 514 UDP/TCP |
+| syslog-processor | aktiv, Port 8514 loopback |
+| T_Syslog Template | importiert (ID 11032), auf 38 Hosts angewendet |
+
+---
+
 ## Übersicht
 
 Zentraler Syslog-Empfänger für alle Zabbix-überwachten Geräte.
@@ -41,7 +53,7 @@ Alle Geräte (LXC, Proxmox, OPNsense, MikroTik, Windows, IoT)
   │  transform: VRL      │  • RAM-Buffer (25.000 Events)
   │  sink: http          │  • Strukturiertes JSON → HTTP POST
   └──────────┬───────────┘
-             │ HTTP POST (JSON)
+             │ HTTP POST (JSON-Array)
              ▼
   ┌──────────────────────┐
   │   Python-Prozessor   │  systemd-Service
@@ -137,11 +149,14 @@ Keine Disk-I/O für den Buffer — ausschließlich RAM.
 
 ### Template: T_Syslog
 
-Wird auf **alle** Zabbix-überwachten Hosts angewendet:
+- **Zabbix-ID:** 11032
+- **Importiert:** 2026-04-03
+- **Auf Hosts angewendet:** 38
 
 ```
-Item:    syslog.event   (Typ: Zabbix Trapper, Wert: Text)
-Trigger: Severity-abhängig aus dem Item-Wert
+Item:    syslog.event   (Typ: Zabbix Trapper, Wert-Typ: Log)
+History: 30 Tage
+Trends:  deaktiviert
 ```
 
 ### Datenformat (zabbix_sender)
@@ -149,16 +164,17 @@ Trigger: Severity-abhängig aus dem Item-Wert
 ```
 Host:  <zabbix-hostname>
 Key:   syslog.event
-Value: CRIT|sshd: authentication failure for root from 1.2.3.4
+Value: WARN|sshd: authentication failure for root from 10.0.0.1
        ^^^^  ─────────────────────────────────────────────────
        Sev.  Original-Syslog-Message
 ```
 
 ### Zabbix API-Zugang
 
-- **URL:** `http://10.1.1.103/api_jsonrpc.php`
+- **URL:** `http://10.1.1.103/zabbix/api_jsonrpc.php`
+- **Auth:** Bearer Token (Zabbix 7.x API-Token, kein user.login)
 - **Credentials:** Vaultwarden → Org "Bots" → "Zabbix API syslog-zabbix"
-- **Berechtigungen:** Read-only (nur `host.get`)
+- **Berechtigungen:** Read-only (nur `host.get`) via Usergroup "Syslog-Service" (ID 15)
 
 ---
 
@@ -166,10 +182,10 @@ Value: CRIT|sshd: authentication failure for root from 1.2.3.4
 
 | Komponente | Technologie | Version |
 |---|---|---|
-| Syslog-Receiver | Vector | aktuell stable |
-| Prozessor | Python 3 + FastAPI | Python ≥ 3.11 |
+| Syslog-Receiver | Vector | 0.54.0 |
+| Prozessor | Python 3.12 + FastAPI | — |
 | Host-Cache | SQLite (aiosqlite) | — |
-| Zabbix-Sender | zabbix_sender CLI | — |
+| Zabbix-Sender | zabbix_sender CLI | 7.4.8 |
 | Service-Manager | systemd | — |
 | Deployment | VM 103, `/opt/syslog-zabbix/` | — |
 
@@ -179,12 +195,12 @@ Value: CRIT|sshd: authentication failure for root from 1.2.3.4
 
 | Parameter | Wert |
 |---|---|
-| Host | Zabbix VM 103 |
+| Host | Zabbix VM 103 (KVM, kein LXC) |
 | IP | 10.1.1.103 |
 | Pfad | `/opt/syslog-zabbix/` |
 | Vector-Config | `/etc/vector/syslog-zabbix.toml` |
 | Python-Service | `/opt/syslog-zabbix/processor/` |
-| Systemd (Vector) | `vector.service` |
+| Systemd (Vector) | `vector.service` + Override `/etc/systemd/system/vector.service.d/override.conf` |
 | Systemd (Python) | `syslog-processor.service` |
 | Syslog-Port | UDP/514, TCP/514 |
 | Python HTTP | `127.0.0.1:8514` (nur loopback) |
@@ -205,73 +221,35 @@ Value: CRIT|sshd: authentication failure for root from 1.2.3.4
 │   └── host_cache.db        # SQLite Host-Mapping Cache
 ├── logs/
 │   └── unresolved.log       # Nicht zuordenbare Syslog-Quellen
-└── systemd/
-    └── syslog-processor.service
+└── venv/                    # Python Virtual Environment
 
 /etc/vector/
-└── syslog-zabbix.toml       # Vector-Konfiguration
+├── syslog-zabbix.toml       # Vector-Konfiguration
+└── vector.yaml.disabled     # Standard-Config deaktiviert
+
+/etc/systemd/system/vector.service.d/
+└── override.conf            # ExecStart mit explizitem Config-Pfad
 ```
 
 ---
 
-## Vector-Konfiguration (Entwurf)
+## HTTP-Payload (Vector → Python)
 
-```toml
-# /etc/vector/syslog-zabbix.toml
+Vector sendet Events immer als **JSON-Array** (auch bei `max_events = 1`):
 
-[sources.syslog_udp]
-type = "syslog"
-mode = "udp"
-address = "0.0.0.0:514"
-
-[sources.syslog_tcp]
-type = "syslog"
-mode = "tcp"
-address = "0.0.0.0:514"
-
-[transforms.severity_filter]
-type = "filter"
-inputs = ["syslog_udp", "syslog_tcp"]
-condition = '.severity_code <= 4'
-
-[sinks.python_processor]
-type = "http"
-inputs = ["severity_filter"]
-uri = "http://127.0.0.1:8514/syslog"
-method = "post"
-encoding.codec = "json"
-
-  [sinks.python_processor.buffer]
-  type = "memory"
-  max_events = 25000
-  when_full = "drop_newest"
-```
-
----
-
-## Python-Prozessor API
-
-### POST /syslog
-
-**Request Body (von Vector):**
 ```json
-{
-  "host": "firewall-01",
-  "hostname": "OPNsense",
+[{
   "source_ip": "10.1.1.254",
+  "hostname": "opnsense",
   "severity": "err",
   "severity_code": 3,
   "facility": "kern",
   "message": "filterlog: TCP:443 blocked from 1.2.3.4",
-  "timestamp": "2026-04-03T10:15:30Z"
-}
+  "timestamp": "2026-04-03T10:15:30+00:00"
+}]
 ```
 
-**Verarbeitung:**
-1. Host-Lookup: IP → Zabbix API (Cache, TTL 60 min)
-2. Fallback: Hostname → Zabbix API
-3. Kein Treffer → `unresolved.log`
-4. Treffer → `zabbix_sender -z 127.0.0.1 -s <host> -k syslog.event -o "<SEV>|<message>"`
+Der Python-Endpoint `/syslog` akzeptiert sowohl Arrays als auch einzelne Objekte.
 
 ---
 
@@ -281,9 +259,8 @@ encoding.codec = "json"
 # /opt/syslog-zabbix/processor/config.yaml
 
 zabbix:
-  api_url: "http://10.1.1.103/api_jsonrpc.php"
-  api_user: "syslog-zabbix"
-  api_password: ""          # aus Vaultwarden laden
+  api_url: "http://10.1.1.103/zabbix/api_jsonrpc.php"
+  api_token: "<bearer-token>"   # Zabbix 7.x API-Token
   sender_host: "127.0.0.1"
   sender_port: 10051
 
@@ -301,16 +278,44 @@ logging:
 
 ---
 
+## Deployment-Ablauf
+
+```bash
+# 1. Einmalige VM-Einrichtung (User, venv, Vector-Install)
+bash setup_vm103.sh
+
+# 2. Jedes weitere Deployment
+bash deploy.sh
+```
+
+`deploy.sh` arbeitet vollständig via SSH (kein pct — VM 103 ist KVM, kein LXC).
+
+---
+
+## Bekannte Probleme & Lösungen
+
+| Problem | Ursache | Lösung |
+|---|---|---|
+| Vector lädt Config doppelt | `VECTOR_CONFIG` Env + `--config-toml` Flag | Nur systemd-Override mit explizitem Pfad |
+| `strip_prefix()` nicht gefunden | VRL 0.54 kennt diese Funktion nicht | `slice!(inner, 1)` für IPv6 |
+| `to_timestamp()` nicht gefunden | VRL 0.54 kennt diese Funktion nicht | `format_timestamp!(.timestamp, ...)` direkt |
+| HTTP 422 von Processor | Vector sendet JSON-Array, nicht Objekt | Endpoint akzeptiert beide Formate |
+| Bearer-Auth fehlgeschlagen | Alter Code nutzte `user.login` Session | Zabbix 7.x: API-Token in `Authorization: Bearer` Header |
+| zabbix_sender failed: 1 | Template nicht auf Host angewendet | T_Syslog auf alle Hosts deployen |
+
+---
+
 ## Offene Punkte / Nächste Schritte
 
-- [ ] Zabbix-Template `T_Syslog` definieren (Item + Trigger-Regeln)
-- [ ] Zabbix API-User anlegen (Read-only, nur `host.get`)
-- [ ] Credentials in Vaultwarden ablegen
-- [ ] Vector installieren auf VM 103
-- [ ] Python-Umgebung einrichten (venv, requirements)
-- [ ] Port 514 in Firewall/OPNsense öffnen (UDP+TCP → VM 103)
-- [ ] Alle Zabbix-Hosts mit Template `T_Syslog` verknüpfen
-- [ ] Syslog-Forwarding auf Quellgeräten konfigurieren
+- [ ] Syslog-Forwarding auf Quellgeräten konfigurieren:
+  - [ ] OPNsense (WI-FW01): System → Logging → Remote → `10.1.1.103:514 UDP`
+  - [ ] MikroTik (C-R01, HU-R01): `/system logging action`
+  - [ ] LXCs: rsyslog.d-Drop-in `*.warning @10.1.1.103:514`
+  - [ ] Proxmox-Host: rsyslog forwarding
+- [ ] T_Syslog auf weitere Hosts nachpflegen (Hosts ohne Interface-IP)
+- [ ] `unresolved.log` nach ersten echten Events prüfen
+- [ ] Port 514 UDP/TCP in OPNsense-Firewall für alle VLANs freigeben
+- [ ] Vector-Update-Prozedur dokumentieren (setcap nach Update)
 
 ---
 
@@ -324,3 +329,5 @@ logging:
 | Host-Mapping | IP primär, Hostname Fallback | Robusteste Lösung für gemischte Infrastruktur |
 | UI | Keine | Alles über Zabbix |
 | Deployment | VM 103 (neben Zabbix) | Kurze Wege, zabbix_sender lokal verfügbar |
+| Auth | API-Token (Bearer) | Zabbix 7.x Standard, kein Session-Management |
+| Deploy-Methode | SSH + rsync | VM 103 ist KVM, kein LXC (kein pct möglich) |

@@ -6,166 +6,181 @@ als JSON per HTTP POST an den Python-Prozessor (`syslog-processor.service`) weit
 
 **Deployment-Ziel:** VM 103, IP `10.1.1.103`
 **Config-Pfad:** `/etc/vector/syslog-zabbix.toml`
+**Getestete Version:** Vector 0.54.0
 
 ---
 
-## Installation (Debian/Ubuntu, ohne Docker, ohne problematische apt-Keys)
+## Installation (Debian/Ubuntu, ohne Docker)
 
-Vector stellt ein offizielles Shell-Installer-Skript bereit, das direkt ein
-signiertes Paket installiert — kein manuelles Key-Management nötig.
+Vector stellt ein offizielles Shell-Installer-Skript bereit:
 
 ```bash
-# 1. Installer herunterladen und ausführen (als root)
-curl -1sLf 'https://repositories.vector.dev/setup.bash' | bash
+# 1. Installer ausführen (als root auf VM 103)
+bash <(curl -fsSL https://setup.vector.dev)
 
 # 2. Vector installieren
 apt-get install -y vector
 
-# 3. Vector-Version prüfen
+# 3. Version prüfen
 vector --version
 ```
 
-Alternativ: Manueller Download des Debian-Pakets von
-https://github.com/vectordotdev/vector/releases/latest
-(Datei: `vector_<version>_amd64.deb`) und Installation via `dpkg -i`.
+---
 
-### systemd-Service konfigurieren
+## systemd-Override konfigurieren
 
-Vector bringt eine systemd-Unit mit, die beim apt-Install automatisch angelegt
-wird. Vor dem Start muss das Log-Level gesetzt werden:
+Die Standard-Unit lädt `/etc/vector/vector.yaml`. Da wir eine eigene Config nutzen,
+braucht Vector einen systemd-Override mit explizitem Config-Pfad.
+
+**Wichtig:** Die Standard-Config deaktivieren, damit Vector sie nicht zusätzlich lädt:
 
 ```bash
-# Override-Verzeichnis anlegen
-mkdir -p /etc/systemd/system/vector.service.d
+# Standard-Config deaktivieren
+mv /etc/vector/vector.yaml /etc/vector/vector.yaml.disabled
 
-# Log-Level auf WARN setzen (kein Debug im Normalbetrieb)
-cat > /etc/systemd/system/vector.service.d/log-level.conf <<EOF
+# Override anlegen
+mkdir -p /etc/systemd/system/vector.service.d
+cat > /etc/systemd/system/vector.service.d/override.conf <<'EOF'
 [Service]
-Environment=VECTOR_LOG=warn
+ExecStartPre=
+ExecStart=
+ExecStartPre=/usr/bin/vector validate /etc/vector/syslog-zabbix.toml
+ExecStart=/usr/bin/vector --config-toml /etc/vector/syslog-zabbix.toml
 EOF
 
 systemctl daemon-reload
 ```
+
+**Warum beide Zeilen löschen?** `ExecStartPre=` und `ExecStart=` (leer) setzen
+die entsprechenden Felder zurück. Die folgenden Zeilen fügen die neuen Werte hinzu.
+Ohne den Rücksetz-Schritt würden die neuen Zeilen an die bestehenden angehängt.
 
 ---
 
 ## Konfiguration deployen
 
 ```bash
-# Config-Datei deployen
-cp /opt/syslog-zabbix/vector/syslog-zabbix.toml /etc/vector/syslog-zabbix.toml
-
-# Standard-Config deaktivieren (falls vorhanden — kollidiert mit Port 514)
-# Vector lädt alle *.toml-Dateien in /etc/vector/ — entweder löschen oder umbenennen:
-mv /etc/vector/vector.toml /etc/vector/vector.toml.disabled 2>/dev/null || true
+# Config auf VM 103 kopieren
+scp vector/syslog-zabbix.toml root@10.1.1.103:/etc/vector/syslog-zabbix.toml
+chmod 644 /etc/vector/syslog-zabbix.toml
 ```
 
 ---
 
 ## Konfiguration validieren
 
-Vor dem Start immer die Config syntaktisch und semantisch prüfen:
+Vor dem Start immer prüfen:
 
 ```bash
-# Syntax und Schema prüfen (ohne Vector zu starten)
 vector validate /etc/vector/syslog-zabbix.toml
 
 # Erwartete Ausgabe:
 # √ Loaded ["/etc/vector/syslog-zabbix.toml"]
 # √ Component configuration
-# √ Health checks
-# ...
-# Configuration valid.
+# √ Health check "python_processor"
+# -------------------------------------------
+#                           Validated
 ```
 
-Falls Fehler auftreten, zeigt `vector validate` genaue Zeilennummern.
+Falls Fehler auftreten, zeigt `vector validate` genaue Zeilennummern und Fehlertypen.
 
 ---
 
-## Service starten und überwachen
+## Service starten
 
 ```bash
-# Service starten und für Autostart aktivieren
+# Aktivieren und starten
 systemctl enable --now vector
 
 # Status prüfen
 systemctl status vector
 
-# Live-Logs beobachten (Log-Level ist warn — nur Fehler und Warnungen)
+# Logs beobachten
 journalctl -u vector -f
 ```
 
 ---
 
-## vector top — Live-Monitoring
-
-`vector top` zeigt eine interaktive Echtzeit-Ansicht aller Components mit
-Durchsatz, Fehlerrate und Buffer-Füllstand:
+## Live-Monitoring
 
 ```bash
 vector top
 ```
 
-Relevante Metriken im Betrieb:
-- `syslog_udp` / `syslog_tcp`: Eingehende Events pro Sekunde
-- `severity_filter`: Verhältnis gefilterte/weitergeleitetete Events
+Relevante Metriken:
+- `syslog_udp` / `syslog_tcp`: Eingehende Events/s
+- `severity_filter`: Durchsatzrate (nur severity ≤ 4 passieren)
 - `normalize_fields`: Transform-Fehlerrate (sollte 0 sein)
-- `python_processor`: HTTP-Fehlerrate, Buffer-Füllstand (max 25.000)
+- `python_processor`: HTTP-Fehlerrate + Buffer-Füllstand
 
-Bei erhöhtem Buffer-Füllstand: Python-Prozessor prüfen (`systemctl status syslog-processor`).
+Bei erhöhtem Buffer-Füllstand: `systemctl status syslog-processor` prüfen.
 
 ---
 
 ## Hinweis: Port 514 (privilegierter Port)
 
-Port 514 ist ein privilegierter Port (< 1024). Vector muss entweder als root
-laufen oder die Capability `CAP_NET_BIND_SERVICE` gesetzt haben.
+Die Standard-systemd-Unit enthält bereits `AmbientCapabilities=CAP_NET_BIND_SERVICE`,
+sodass Vector als nicht-root-User Port 514 binden darf.
 
-**Option A: Capability setzen (empfohlen, kein root-Prozess):**
+Bei einem manuellen Vector-Binary-Update muss die Capability ggf. neu gesetzt werden:
 
 ```bash
-# Capability auf das Vector-Binary setzen
 setcap CAP_NET_BIND_SERVICE=+eip /usr/bin/vector
-
-# Prüfen
 getcap /usr/bin/vector
-# Erwartete Ausgabe: /usr/bin/vector cap_net_bind_service=eip
 ```
-
-Hinweis: Bei Vector-Updates muss `setcap` erneut gesetzt werden.
-Alternativ: systemd-Unit mit `AmbientCapabilities=CAP_NET_BIND_SERVICE` konfigurieren:
-
-```bash
-cat > /etc/systemd/system/vector.service.d/cap-bind.conf <<EOF
-[Service]
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-EOF
-
-systemctl daemon-reload
-systemctl restart vector
-```
-
-**Option B: Als root ausführen (einfacher, weniger sicher):**
-
-Die Standard-systemd-Unit läuft als `root` — Port 514 funktioniert ohne
-weitere Anpassungen. Für eine Produktionsumgebung ist Option A vorzuziehen.
 
 ---
 
-## Zusammenspiel mit dem Python-Prozessor
+## Payload-Format (Vector → Python-Processor)
 
-Vector sendet pro Event einen HTTP POST an `http://127.0.0.1:8514/syslog`.
-Das JSON-Payload enthält folgende Felder:
+Vector sendet Events als **JSON-Array** per HTTP POST, auch bei `max_events = 1`:
 
-| Feld | Typ | Beispiel |
-|---|---|---|
-| `source_ip` | String | `"10.1.1.254"` |
-| `hostname` | String | `"opnsense"` |
-| `severity` | String | `"err"`, `"crit"`, `"warning"` |
-| `severity_code` | Integer | `3` |
-| `facility` | String | `"kern"`, `"daemon"` |
-| `message` | String | `"filterlog: TCP:443 blocked..."` |
-| `timestamp` | String (ISO 8601) | `"2026-04-03T10:15:30+00:00"` |
+```json
+[{
+  "source_ip": "10.1.1.254",
+  "hostname": "opnsense",
+  "severity": "err",
+  "severity_code": 3,
+  "facility": "kern",
+  "message": "filterlog: TCP:443 blocked from 1.2.3.4",
+  "timestamp": "2026-04-03T10:15:30+00:00"
+}]
+```
 
-Der Python-Prozessor erwartet **ein Event pro Request** — kein Array.
+Interne Vector-Felder (`appname`, `procid`, `msgid`, `structured_data`, `version`,
+`source_type`) werden im VRL-Transform entfernt.
+
+---
+
+## VRL-Besonderheiten (Vector 0.54.x)
+
+Folgende Standard-Funktionen existieren in Vector 0.54.x **nicht**:
+
+| Nicht verfügbar | Alternative |
+|---|---|
+| `strip_prefix(s, prefix)` | `slice!(s, length(prefix))` |
+| `to_timestamp(value)` | Nicht nötig — `.timestamp` ist bereits Timestamp-Typ |
+
+`.timestamp` aus dem `syslog`-Source ist ein nativer Timestamp-Typ und kann
+direkt mit `format_timestamp!(.timestamp, format: "%+")` formatiert werden.
+
+---
+
+## Fehlerbehebung
+
+**Vector startet nicht (duplicate source id):**
+```
+x duplicate source id found: syslog_tcp
+```
+Ursache: Config wird doppelt geladen (Standard-Config + eigene Config).
+Lösung: `vector.yaml` umbenennen zu `vector.yaml.disabled`.
+
+**HTTP 422 vom Python-Processor:**
+Ursache: Payload-Format stimmt nicht mit Pydantic-Model überein.
+Debug: `journalctl -u vector -n 20` zeigt HTTP-Status.
+Direkttest:
+```bash
+curl -s -X POST http://127.0.0.1:8514/syslog \
+  -H 'Content-Type: application/json' \
+  -d '[{"source_ip":"10.1.1.1","hostname":"host","severity":"warning","severity_code":4,"facility":"daemon","message":"test","timestamp":"2026-01-01T00:00:00Z"}]'
+```
