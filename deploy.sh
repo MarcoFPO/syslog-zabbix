@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # deploy.sh — Deployment von syslog-zabbix auf VM 103 (10.1.1.103)
 #
-# Ausfuehren auf dem Proxmox-Host (10.1.1.100):
+# Ausfuehren lokal (Claude-LXC oder Proxmox-Host):
 #   bash /opt/Projekte/syslog/deploy.sh
 #
 # Was dieses Script tut:
 #   1. Erreichbarkeit von VM 103 pruefen
 #   2. Verzeichnisse auf VM 103 anlegen
-#   3. processor/ auf VM 103 kopieren (pct push)
+#   3. processor/ auf VM 103 kopieren (rsync via SSH)
 #   4. systemd/syslog-processor.service auf VM 103 kopieren
 #   5. Vector-Config auf VM 103 kopieren (/etc/vector/)
 #   6. pip install im venv auf VM 103 ausfuehren
@@ -15,8 +15,7 @@
 #   8. Status-Check
 #
 # Voraussetzungen:
-#   - Ausfuehren auf Proxmox-Host (10.1.1.100) als root
-#   - VM 103 laeuft und ist via pct erreichbar
+#   - VM 103 (KVM) laeuft und ist via SSH erreichbar (root@10.1.1.103)
 #   - setup_vm103.sh wurde bereits einmalig ausgefuehrt
 
 set -Eeuo pipefail
@@ -25,8 +24,7 @@ set -Eeuo pipefail
 # Konstanten
 # ---------------------------------------------------------------------------
 
-readonly PROXMOX_HOST="10.1.1.100"
-readonly VM_ID="103"
+readonly VM_HOST="root@10.1.1.103"
 readonly DEPLOY_DIR="/opt/syslog-zabbix"
 readonly SERVICE_USER="syslog-processor"
 readonly SERVICE_NAME="syslog-processor"
@@ -68,16 +66,16 @@ die() {
   exit 1
 }
 
-# pct exec Wrapper — fuehrt Befehl auf VM 103 aus
+# SSH-Wrapper — fuehrt Befehl auf VM 103 aus
 vm_exec() {
-  pct exec "${VM_ID}" -- "$@"
+  ssh "${VM_HOST}" "$@"
 }
 
-# pct push Wrapper — kopiert Datei auf VM 103
+# SCP-Wrapper — kopiert Datei auf VM 103
 vm_push() {
   local src="$1"
   local dst="$2"
-  pct push "${VM_ID}" "${src}" "${dst}"
+  scp -q "${src}" "${VM_HOST}:${dst}"
 }
 
 # ---------------------------------------------------------------------------
@@ -87,9 +85,9 @@ vm_push() {
 check_prerequisites() {
   log_info "Pruefe Vorbedingungen ..."
 
-  # Nur auf Proxmox-Host ausfuehren
-  if ! command -v pct &>/dev/null; then
-    die "pct nicht gefunden. Dieses Script muss auf dem Proxmox-Host ausgefuehrt werden."
+  # SSH-Erreichbarkeit pruefen
+  if ! command -v ssh &>/dev/null; then
+    die "ssh nicht gefunden."
   fi
 
   # Quelldateien vorhanden?
@@ -112,21 +110,12 @@ check_prerequisites() {
 # ---------------------------------------------------------------------------
 
 check_vm_reachable() {
-  log_step "1" "VM ${VM_ID} Erreichbarkeit pruefen"
+  log_step "1" "VM 103 Erreichbarkeit pruefen (SSH)"
 
-  # VM-Status via pct pruefen
-  local vm_status
-  vm_status="$(pct status "${VM_ID}" 2>/dev/null || true)"
-  if [[ "${vm_status}" != "status: running" ]]; then
-    die "VM ${VM_ID} ist nicht erreichbar oder laeuft nicht. Status: '${vm_status}'"
+  if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "${VM_HOST}" true 2>/dev/null; then
+    die "SSH zu ${VM_HOST} nicht moeglich. VM laeuft? SSH-Key hinterlegt?"
   fi
-  log_ok "VM ${VM_ID} laeuft."
-
-  # Kurzer Funktionstest via pct exec
-  if ! vm_exec true 2>/dev/null; then
-    die "pct exec ${VM_ID} funktioniert nicht."
-  fi
-  log_ok "pct exec auf VM ${VM_ID} funktioniert."
+  log_ok "SSH zu ${VM_HOST} erfolgreich."
 }
 
 # ---------------------------------------------------------------------------
@@ -134,7 +123,7 @@ check_vm_reachable() {
 # ---------------------------------------------------------------------------
 
 create_remote_directories() {
-  log_step "2" "Verzeichnisse auf VM ${VM_ID} anlegen"
+  log_step "2" "Verzeichnisse auf VM 103 anlegen"
 
   local -a dirs=(
     "${DEPLOY_DIR}/processor"
@@ -155,19 +144,11 @@ create_remote_directories() {
 # ---------------------------------------------------------------------------
 
 copy_processor() {
-  log_step "3" "processor/ nach VM ${VM_ID}:${PROCESSOR_DST} kopieren"
+  log_step "3" "processor/ nach VM 103:${PROCESSOR_DST} kopieren"
 
-  # Alle Dateien im processor-Verzeichnis einzeln pushen
-  while IFS= read -r -d '' file; do
-    local relative_path="${file#"${PROCESSOR_SRC}/"}"
-    local dst_path="${PROCESSOR_DST}/${relative_path}"
-    # Unterverzeichnisse auf VM anlegen
-    local dst_dir
-    dst_dir="$(dirname -- "${dst_path}")"
-    vm_exec mkdir -p -- "${dst_dir}"
-    vm_push "${file}" "${dst_path}"
-    log_ok "${relative_path}"
-  done < <(find "${PROCESSOR_SRC}" -type f -print0)
+  # rsync via SSH — effizienter als einzelne scp-Aufrufe
+  rsync -az --delete "${PROCESSOR_SRC}/" "${VM_HOST}:${PROCESSOR_DST}/"
+  log_ok "processor/ synchronisiert."
 
   # Permissions setzen
   vm_exec chown -R "root:${SERVICE_USER}" "${PROCESSOR_DST}"
@@ -180,7 +161,7 @@ copy_processor() {
 # ---------------------------------------------------------------------------
 
 copy_service_file() {
-  log_step "4" "syslog-processor.service nach VM ${VM_ID}:${SERVICE_DST} kopieren"
+  log_step "4" "syslog-processor.service nach VM 103:${SERVICE_DST} kopieren"
 
   vm_push "${SERVICE_SRC}" "${SERVICE_DST}"
   vm_exec chmod 644 "${SERVICE_DST}"
@@ -192,7 +173,7 @@ copy_service_file() {
 # ---------------------------------------------------------------------------
 
 copy_vector_config() {
-  log_step "5" "Vector-Config nach VM ${VM_ID}:${VECTOR_CONFIG_DST} kopieren"
+  log_step "5" "Vector-Config nach VM 103:${VECTOR_CONFIG_DST} kopieren"
 
   vm_push "${VECTOR_CONFIG_SRC}" "${VECTOR_CONFIG_DST}"
   vm_exec chmod 644 "${VECTOR_CONFIG_DST}"
@@ -204,7 +185,7 @@ copy_vector_config() {
 # ---------------------------------------------------------------------------
 
 install_python_deps() {
-  log_step "6" "pip install im venv auf VM ${VM_ID}"
+  log_step "6" "pip install im venv auf VM 103"
 
   local requirements_remote="${PROCESSOR_DST}/requirements.txt"
 
@@ -258,7 +239,7 @@ check_service_status() {
     log_ok "${SERVICE_NAME}: active (running)"
   else
     log_error "${SERVICE_NAME}: Status = '${processor_status}'"
-    log_info "Logs anzeigen: pct exec ${VM_ID} -- journalctl -u ${SERVICE_NAME} -n 30"
+    log_info "Logs anzeigen: ssh ${VM_HOST} journalctl -u ${SERVICE_NAME} -n 30"
     die "Service ${SERVICE_NAME} ist nicht aktiv."
   fi
 
@@ -273,9 +254,9 @@ check_service_status() {
   printf '\n'
   log_ok "Deployment abgeschlossen."
   printf '\nNuetzliche Befehle:\n'
-  printf '  Logs:    pct exec %s -- journalctl -u %s -f\n' "${VM_ID}" "${SERVICE_NAME}"
-  printf '  Status:  pct exec %s -- systemctl status %s\n' "${VM_ID}" "${SERVICE_NAME}"
-  printf '  Restart: pct exec %s -- systemctl restart %s\n' "${VM_ID}" "${SERVICE_NAME}"
+  printf '  Logs:    ssh %s journalctl -u %s -f\n' "${VM_HOST}" "${SERVICE_NAME}"
+  printf '  Status:  ssh %s systemctl status %s\n' "${VM_HOST}" "${SERVICE_NAME}"
+  printf '  Restart: ssh %s systemctl restart %s\n' "${VM_HOST}" "${SERVICE_NAME}"
 }
 
 # ---------------------------------------------------------------------------
@@ -283,7 +264,7 @@ check_service_status() {
 # ---------------------------------------------------------------------------
 
 main() {
-  printf '=== syslog-zabbix Deployment → VM %s ===\n' "${VM_ID}"
+  printf '=== syslog-zabbix Deployment → VM 103 ===\n' "103"
   printf 'Zeitstempel: %s\n\n' "$(date --iso-8601=seconds)"
 
   check_prerequisites

@@ -1,7 +1,6 @@
 zabbix:
-  api_url: "http://10.1.1.103/api_jsonrpc.php"
-  api_user: "syslog-zabbix"
-  api_password: ""
+  api_url: "http://10.1.1.103/zabbix/api_jsonrpc.php"
+  api_token: "c05ba11ceed887ec0cdaf3c8b9c4c05d86e54dd53bbd17dc2fba35698c2c0e5e"
   sender_host: "127.0.0.1"
   sender_port: 10051
 

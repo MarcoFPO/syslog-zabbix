@@ -34,17 +34,14 @@ class HostResolver:
     def __init__(
         self,
         api_url: str,
-        api_user: str,
-        api_password: str,
+        api_token: str,
         db_path: str,
         ttl_minutes: int = 60,
     ) -> None:
         self._api_url = api_url
-        self._api_user = api_user
-        self._api_password = api_password
+        self._api_token = api_token
         self._db_path = db_path
         self._ttl_seconds = ttl_minutes * 60
-        self._auth_token: str | None = None
         self._db: aiosqlite.Connection | None = None
 
     # ------------------------------------------------------------------
@@ -62,7 +59,6 @@ class HostResolver:
         if self._db:
             await self._db.close()
             self._db = None
-        self._auth_token = None
         logger.info("Host-Resolver gestoppt")
 
     # ------------------------------------------------------------------
@@ -125,40 +121,8 @@ class HostResolver:
     # Zabbix JSON-RPC
     # ------------------------------------------------------------------
 
-    async def _ensure_auth(self) -> str:
-        """Authentifiziert sich bei der Zabbix API und gibt das Token zurueck."""
-        if self._auth_token is not None:
-            return self._auth_token
-
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "user.login",
-            "params": {
-                "username": self._api_user,
-                "password": self._api_password,
-            },
-            "id": 1,
-        }
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(self._api_url, json=payload)
-            resp.raise_for_status()
-
-        data = resp.json()
-        if "error" in data:
-            raise RuntimeError(f"Zabbix login fehlgeschlagen: {data['error']}")
-
-        self._auth_token = data["result"]
-        logger.info("Zabbix API authentifiziert")
-        return self._auth_token
-
     async def _host_get(self, filter_params: dict) -> str | None:
-        """Fuehrt host.get aus und gibt den ersten Hostnamen zurueck."""
-        try:
-            auth = await self._ensure_auth()
-        except Exception:
-            logger.exception("Zabbix API Authentifizierung fehlgeschlagen")
-            return None
-
+        """Fuehrt host.get mit Bearer-Token-Auth aus."""
         payload = {
             "jsonrpc": "2.0",
             "method": "host.get",
@@ -167,23 +131,21 @@ class HostResolver:
                 "output": ["host"],
                 "limit": 1,
             },
-            "auth": auth,
-            "id": 2,
+            "id": 1,
         }
+        headers = {"Authorization": f"Bearer {self._api_token}"}
 
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(self._api_url, json=payload)
+                resp = await client.post(self._api_url, json=payload, headers=headers)
                 resp.raise_for_status()
         except Exception:
             logger.exception("Zabbix API Anfrage fehlgeschlagen")
-            self._auth_token = None  # Token koennte abgelaufen sein
             return None
 
         data = resp.json()
         if "error" in data:
             logger.error("Zabbix API Fehler: %s", data["error"])
-            self._auth_token = None
             return None
 
         hosts = data.get("result", [])

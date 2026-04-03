@@ -17,7 +17,7 @@ from typing import AsyncIterator
 import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from host_resolver import HostResolver
 from zabbix_sender import ZabbixSender
@@ -92,9 +92,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     unresolved_log.parent.mkdir(parents=True, exist_ok=True)
 
     resolver = HostResolver(
-        api_url=zabbix_cfg.get("api_url", "http://10.1.1.103/api_jsonrpc.php"),
-        api_user=zabbix_cfg.get("api_user", "syslog-zabbix"),
-        api_password=zabbix_cfg.get("api_password", ""),
+        api_url=zabbix_cfg.get("api_url", "http://10.1.1.103/zabbix/api_jsonrpc.php"),
+        api_token=zabbix_cfg.get("api_token", ""),
         db_path=cache_cfg.get("db_path", "/opt/syslog-zabbix/db/host_cache.db"),
         ttl_minutes=cache_cfg.get("ttl_minutes", 60),
     )
@@ -133,12 +132,11 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/syslog", status_code=202)
-async def receive_syslog(event: SyslogEvent) -> dict:
+async def _process_event(event: SyslogEvent) -> dict:
+    """Verarbeitet ein einzelnes Syslog-Event."""
     assert resolver is not None
     assert sender is not None
 
-    # Host aufloesen
     try:
         zabbix_host = await resolver.resolve(event.source_ip, event.hostname)
     except Exception:
@@ -155,13 +153,36 @@ async def receive_syslog(event: SyslogEvent) -> dict:
         _log_unresolved(event, reason="no_match")
         return {"status": "unresolved", "detail": "no zabbix host found"}
 
-    # An Zabbix senden
     ok = await sender.send(zabbix_host, event.severity_code, event.message)
     if not ok:
         logger.error("zabbix_sender fehlgeschlagen fuer host=%s", zabbix_host)
         return {"status": "send_failed", "host": zabbix_host}
 
     return {"status": "accepted", "host": zabbix_host}
+
+
+@app.post("/syslog", status_code=202)
+async def receive_syslog(request: Request) -> dict:
+    """Empfaengt Syslog-Events von Vector (JSON-Array oder einzelnes Objekt)."""
+    body = await request.json()
+
+    # Vector sendet immer ein JSON-Array auch bei max_events=1
+    try:
+        if isinstance(body, list):
+            events = [SyslogEvent(**e) for e in body]
+        else:
+            events = [SyslogEvent(**body)]
+    except (ValidationError, TypeError) as exc:
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    results = []
+    for event in events:
+        result = await _process_event(event)
+        results.append(result)
+
+    if len(results) == 1:
+        return results[0]
+    return {"status": "accepted", "processed": len(results)}
 
 
 @app.exception_handler(Exception)
