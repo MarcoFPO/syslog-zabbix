@@ -1,0 +1,302 @@
+# =============================================================================
+# Vector Konfiguration: syslog-zabbix
+# =============================================================================
+#
+# Empfängt Syslog-Meldungen (UDP + TCP, Port 514) von allen Netzwerkgeräten
+# und Linux-Hosts. Filtert auf WARNING und kritischere Events (severity <= 4)
+# und leitet sie strukturiert als JSON per HTTP POST an den Python-Prozessor
+# weiter (syslog-processor.service, Port 8514).
+#
+# Deploy-Pfad:   /etc/vector/syslog-zabbix.toml
+# Gestartet via: vector.service (systemd)
+# Ziel-Host:     VM 103, 10.1.1.103
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Globale Log-Einstellungen
+# Kein Debug im Normalbetrieb — nur WARN und kritischer.
+# -----------------------------------------------------------------------------
+[api]
+enabled = false
+
+# Vector-eigenes Log-Level (nicht Syslog-Severity, sondern Vector-interne Logs)
+# Gültige Werte: trace, debug, info, warn, error
+# Wird via Umgebungsvariable VECTOR_LOG in der systemd-Unit gesetzt:
+#   Environment=VECTOR_LOG=warn
+# Diese Datei steuert nur die Quellen, Transforms und Sinks.
+
+
+# =============================================================================
+# SOURCES
+# =============================================================================
+# Beide Quellen empfangen sowohl RFC 3164 (BSD Syslog, klassisch) als auch
+# RFC 5424 (IETF Syslog, strukturiert). Vector erkennt das Format automatisch.
+#
+# Gerätetypen:
+#   - Linux LXC / VMs: rsyslog / journald mit syslog-Forwarding
+#   - Proxmox-Host: rsyslog UDP
+#   - OPNsense / MikroTik: UDP RFC 3164 nativ
+#   - Windows (NXLog/Syslog-Agent): UDP oder TCP
+#   - IoT / Managed Switches: UDP RFC 3164
+# -----------------------------------------------------------------------------
+
+[sources.syslog_udp]
+type    = "syslog"
+mode    = "udp"
+address = "0.0.0.0:514"
+
+# Maximale Paketgrösse: UDP-Syslog kann bis zu 64 KB groß sein (RFC 5424).
+# Vector-Standard (65535 Bytes) passt — explizit belassen.
+max_length = 65535
+
+[sources.syslog_tcp]
+type    = "syslog"
+mode    = "tcp"
+address = "0.0.0.0:514"
+
+# Verbindungslimit für TCP-Quellen (Windows, journald-Forwarding).
+# 100 gleichzeitige Verbindungen sind für diese Infrastruktur ausreichend.
+connection_limit = 100
+
+
+# =============================================================================
+# TRANSFORMS
+# =============================================================================
+# Schritt 1: Severity-Filter
+# Schritt 2: VRL-Remap — Felder normalisieren und source_ip sicherstellen
+# -----------------------------------------------------------------------------
+
+# --- Schritt 1: Severity-Filter ------------------------------------------
+# Nur Events mit severity_code <= 4 (EMERGENCY=0 bis WARNING=4) passieren.
+# NOTICE (5), INFO (6), DEBUG (7) werden hier verworfen.
+#
+# Vector legt severity_code aus dem Syslog-Header automatisch an.
+# Bei RFC 3164-Geräten ohne expliziten Severity-Code ist das Feld ggf. null.
+# In diesem Fall lassen wir das Event durch (null <= 4 ist false in VRL →
+# wird nicht gefiltert). Der Python-Prozessor behandelt solche Events als
+# severity_code = 7 (DEBUG) und ignoriert sie — sicher.
+#
+# Alternativ: Fehler auf der sicheren Seite mit:
+#   condition = '!exists(.severity_code) || .severity_code <= 4'
+# Damit würden Events ohne severity_code immer weitergeleitet (safe default).
+
+[transforms.severity_filter]
+type   = "filter"
+inputs = ["syslog_udp", "syslog_tcp"]
+
+# VRL-Bedingung: Event wird weitergeleitet, wenn Ausdruck true ergibt.
+# to_int() wandelt den Wert sicher um; ok() prüft, ob Konvertierung erfolgreich war.
+condition = '''
+  severity_code, err = to_int(.severity)
+  if err != null {
+    # .severity ist ein String wie "warning", "err", "crit" —
+    # Vector parsiert RFC5424 severity direkt als Integer in .severity.
+    # Bei RFC3164 kann .severity ein String sein.
+    # Sicherheitshalber alle unbekannten Severities durchlassen (Prozessor filtert).
+    true
+  } else {
+    severity_code <= 4
+  }
+'''
+
+
+# --- Schritt 2: VRL-Remap — Felder normalisieren -------------------------
+# Vector liefert nach dem Syslog-Parse folgende Felder (RFC 3164 / RFC 5424):
+#   .hostname       — Hostname aus dem Syslog-Header
+#   .appname        — Prozessname (z.B. "sshd")
+#   .severity       — Severity als String ODER Integer (je nach RFC)
+#   .facility       — Facility als String
+#   .message        — eigentliche Log-Nachricht
+#   .timestamp      — Zeitstempel (RFC 3339 / ISO 8601)
+#   .source_ip      — Quell-IP (nur bei UDP/TCP Sources automatisch gesetzt)
+#
+# Ziel: Einheitliches JSON-Payload für den Python-Prozessor:
+#   source_ip       — IP-Adresse des Absenders (für Host-Mapping primär)
+#   hostname        — Hostname aus Syslog-Header (Fallback für Host-Mapping)
+#   severity        — Severity als String ("warning", "err", "crit", ...)
+#   severity_code   — Severity als Integer (0–4)
+#   facility        — Facility als String ("kern", "daemon", "user", ...)
+#   message         — eigentliche Log-Nachricht
+#   timestamp       — ISO 8601 (UTC, z.B. "2026-04-03T10:15:30Z")
+
+[transforms.normalize_fields]
+type   = "remap"
+inputs = ["severity_filter"]
+
+source = '''
+  # -------------------------------------------------------------------------
+  # source_ip: Quell-IP des Syslog-Absenders
+  # -------------------------------------------------------------------------
+  # Vector setzt .source_ip automatisch bei UDP/TCP Sources.
+  # Bei UDP enthält .source_ip die IP im Format "10.1.1.254:514".
+  # Wir extrahieren nur den Host-Teil (ohne Port).
+  if exists(.source_ip) {
+    src = to_string!(.source_ip)
+    # IPv4: "10.1.1.254:514" → "10.1.1.254"
+    # IPv6: "[::1]:514" → "::1"
+    if starts_with(src, "[") {
+      # IPv6 im Format [addr]:port
+      .source_ip = strip_prefix(split(src, "]:")[0], "[") ?? src
+    } else if contains(src, ":") {
+      # IPv4 im Format addr:port
+      parts = split(src, ":")
+      if length(parts) == 2 {
+        .source_ip = parts[0]
+      }
+      # sonst belassen (reines IP ohne Port)
+    }
+  } else {
+    .source_ip = "unknown"
+  }
+
+  # -------------------------------------------------------------------------
+  # severity: Als String normalisieren
+  # -------------------------------------------------------------------------
+  # Vector liefert .severity je nach RFC als String ("warning") oder
+  # Integer (4). Wir wollen immer einen lesbaren String.
+  sev_map = {
+    "0": "emerg",
+    "1": "alert",
+    "2": "crit",
+    "3": "err",
+    "4": "warning",
+    "5": "notice",
+    "6": "info",
+    "7": "debug"
+  }
+
+  raw_sev = to_string(.severity) ?? "unknown"
+
+  # Falls Severity schon als lesbarer String vorliegt: belassen
+  # Falls als Zahl: in String-Label umwandeln
+  if match(raw_sev, r'^[0-7]$') {
+    .severity = get!(sev_map, [raw_sev])
+  } else {
+    .severity = downcase(raw_sev)
+  }
+
+  # -------------------------------------------------------------------------
+  # severity_code: Als Integer sicherstellen
+  # -------------------------------------------------------------------------
+  # Mapping von String-Label auf Integer-Code
+  sev_code_map = {
+    "emerg":   0,
+    "emergency": 0,
+    "alert":   1,
+    "crit":    2,
+    "critical": 2,
+    "err":     3,
+    "error":   3,
+    "warning": 4,
+    "warn":    4,
+    "notice":  5,
+    "info":    6,
+    "debug":   7
+  }
+
+  code, err = to_int(.severity)
+  if err == null {
+    .severity_code = code
+  } else {
+    mapped_code = get(sev_code_map, [.severity]) ?? 7
+    .severity_code = to_int!(mapped_code)
+  }
+
+  # -------------------------------------------------------------------------
+  # hostname: Fallback wenn leer
+  # -------------------------------------------------------------------------
+  if !exists(.hostname) || .hostname == "-" || .hostname == "" {
+    .hostname = "unknown"
+  }
+
+  # -------------------------------------------------------------------------
+  # facility: Als String sicherstellen
+  # -------------------------------------------------------------------------
+  if !exists(.facility) {
+    .facility = "unknown"
+  } else {
+    .facility = downcase(to_string!(.facility))
+  }
+
+  # -------------------------------------------------------------------------
+  # message: Sicherstellen dass das Feld existiert
+  # -------------------------------------------------------------------------
+  if !exists(.message) || .message == "" {
+    .message = "(empty)"
+  }
+
+  # -------------------------------------------------------------------------
+  # timestamp: ISO 8601 UTC
+  # -------------------------------------------------------------------------
+  # Vector setzt .timestamp als RFC 3339 String oder Timestamp-Objekt.
+  # format_timestamp() gibt ISO 8601 in UTC aus.
+  if exists(.timestamp) {
+    ts, err = to_timestamp(.timestamp)
+    if err == null {
+      .timestamp = format_timestamp!(ts, format: "%+")
+    }
+    # Fehler: .timestamp als String belassen (bereits ISO 8601)
+  } else {
+    .timestamp = format_timestamp!(now(), format: "%+")
+  }
+
+  # -------------------------------------------------------------------------
+  # Interne Vector-Felder entfernen (nicht an Python-Prozessor senden)
+  # -------------------------------------------------------------------------
+  del(.appname)
+  del(.procid)
+  del(.msgid)
+  del(.structured_data)
+  del(.version)
+'''
+
+
+# =============================================================================
+# SINKS
+# =============================================================================
+
+# --- HTTP POST an Python-Prozessor ----------------------------------------
+# Leitet gefilterte und normalisierte Events als JSON an den Python-Service
+# (syslog-processor.service) auf Port 8514 weiter.
+#
+# Konfiguration:
+#   - Ein Event pro Request (batch.max_events = 1) — vereinfacht Python-Code
+#   - Kein TLS (loopback-only, kein Netzwerk zwischen Vector und Python)
+#   - Retry bei HTTP 5xx / Netzwerkfehler: 3 Versuche mit Backoff
+#   - Timeout: 5 Sekunden pro Request (Python muss schnell antworten)
+
+[sinks.python_processor]
+type   = "http"
+inputs = ["normalize_fields"]
+uri    = "http://127.0.0.1:8514/syslog"
+method = "post"
+
+# Encoding: einzelnes JSON-Objekt pro Request
+[sinks.python_processor.encoding]
+codec = "json"
+
+# Batch: ein Event pro HTTP-Request
+# Vereinfacht die Python-Seite erheblich (kein Array-Handling nötig).
+[sinks.python_processor.batch]
+max_events = 1
+timeout_secs = 1
+
+# Request-Einstellungen
+[sinks.python_processor.request]
+timeout_secs        = 5
+retry_attempts      = 3
+retry_initial_backoff_secs = 1
+retry_max_duration_secs    = 10
+
+# Content-Type Header explizit setzen
+[sinks.python_processor.request.headers]
+Content-Type = "application/json"
+
+# Buffer: RAM-Buffer — kein Disk-I/O
+# Schützt gegen kurze Ausfälle des Python-Prozessors (Neustart, Deploy).
+# Kapazität: 25.000 Events ≈ 8 MB RAM ≈ 60 min Puffer bei 400 Events/min.
+[sinks.python_processor.buffer]
+type       = "memory"
+max_events = 25000
+when_full  = "drop_newest"

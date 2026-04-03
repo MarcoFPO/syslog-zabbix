@@ -1,0 +1,106 @@
+zabbix_export:
+  version: '7.4'
+  template_groups:
+    - uuid: 5cbfaece69db46aa89ef10d759e1b39e
+      name: 'Templates/Syslog'
+  templates:
+    - uuid: fcd34376854846d9bcbedb30f0b008f3
+      template: T_Syslog
+      name: 'T_Syslog'
+      description: |
+        Empfängt Syslog-Events via Zabbix Trapper.
+        Eingehendes Format: SEVERITY|MESSAGE
+        Beispiel: CRIT|sshd: authentication failure
+
+        Unterstützte Severity-Präfixe:
+          EMERG  -> Disaster
+          ALERT  -> High
+          CRIT   -> High
+          ERR    -> Average
+          WARN   -> Warning
+      groups:
+        - name: 'Templates/Syslog'
+      items:
+        - uuid: 7289ba86d0e8442ca892b53acc6167e7
+          name: 'Syslog Event'
+          type: TRAP
+          key: syslog.event
+          delay: '0'
+          history: 30d
+          trends: '0'
+          value_type: LOG
+          description: |
+            Empfängt Syslog-Ereignisse via Zabbix Sender.
+            Format: SEVERITY|MESSAGE
+            Gueltige Severity-Werte: EMERG, ALERT, CRIT, ERR, WARN, NOTICE, INFO, DEBUG
+          tags:
+            - tag: component
+              value: syslog
+            - tag: source
+              value: trapper
+  triggers:
+    - uuid: 6ff8547e3df642e68fabe271414a72e9
+      expression: 'find(/T_Syslog/syslog.event,,"regexp","^EMERG\\|")=1'
+      name: 'Syslog EMERG auf {HOST.NAME}'
+      opdata: '{ITEM.LASTVALUE}'
+      priority: DISASTER
+      description: |
+        Ein Syslog-Ereignis mit Severity EMERG wurde empfangen.
+        EMERG = System ist nicht mehr nutzbar (hoechste Prioritaet).
+      tags:
+        - tag: severity
+          value: EMERG
+        - tag: component
+          value: syslog
+    - uuid: 749d114888a1403793a2ae56314a4fd1
+      expression: 'find(/T_Syslog/syslog.event,,"regexp","^ALERT\\|")=1'
+      name: 'Syslog ALERT auf {HOST.NAME}'
+      opdata: '{ITEM.LASTVALUE}'
+      priority: HIGH
+      description: |
+        Ein Syslog-Ereignis mit Severity ALERT wurde empfangen.
+        ALERT = Sofortige Aktion erforderlich.
+      tags:
+        - tag: severity
+          value: ALERT
+        - tag: component
+          value: syslog
+    - uuid: 5ba6413fb50841d29b8e8f19a535e844
+      expression: 'find(/T_Syslog/syslog.event,,"regexp","^CRIT\\|")=1'
+      name: 'Syslog CRIT auf {HOST.NAME}'
+      opdata: '{ITEM.LASTVALUE}'
+      priority: HIGH
+      description: |
+        Ein Syslog-Ereignis mit Severity CRIT wurde empfangen.
+        CRIT = Kritischer Zustand (z.B. Hardware-Fehler).
+      tags:
+        - tag: severity
+          value: CRIT
+        - tag: component
+          value: syslog
+    - uuid: 8033d5b899df4d94b4ac9128152b1508
+      expression: 'find(/T_Syslog/syslog.event,,"regexp","^ERR\\|")=1'
+      name: 'Syslog ERR auf {HOST.NAME}'
+      opdata: '{ITEM.LASTVALUE}'
+      priority: AVERAGE
+      description: |
+        Ein Syslog-Ereignis mit Severity ERR wurde empfangen.
+        ERR = Fehlerbedingungen (z.B. Disk-Fehler, fehlgeschlagene Prozesse).
+      tags:
+        - tag: severity
+          value: ERR
+        - tag: component
+          value: syslog
+    - uuid: 4e7914894f674a61adcc8ecab63aa08f
+      expression: 'find(/T_Syslog/syslog.event,,"regexp","^WARN\\|")=1'
+      name: 'Syslog WARN auf {HOST.NAME}'
+      opdata: '{ITEM.LASTVALUE}'
+      priority: WARNING
+      description: |
+        Ein Syslog-Ereignis mit Severity WARN wurde empfangen.
+        WARN = Warnung, potenziell problematischer Zustand.
+      tags:
+        - tag: severity
+          value: WARN
+        - tag: component
+          value: syslog

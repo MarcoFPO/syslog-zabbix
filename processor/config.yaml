@@ -1,0 +1,17 @@
+zabbix:
+  api_url: "http://10.1.1.103/api_jsonrpc.php"
+  api_user: "syslog-zabbix"
+  api_password: ""
+  sender_host: "127.0.0.1"
+  sender_port: 10051
+
+cache:
+  db_path: "/opt/syslog-zabbix/db/host_cache.db"
+  ttl_minutes: 60
+
+processor:
+  listen_host: "127.0.0.1"
+  listen_port: 8514
+
+logging:
+  unresolved_log: "/opt/syslog-zabbix/logs/unresolved.log"
